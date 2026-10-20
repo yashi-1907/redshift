@@ -1,133 +1,142 @@
+"""
+report_generator.py (v2) - Report Generator Agent.
+
+Changes from v1
+  * Altman cut-offs come from the variant stored in SCORE_RUN.model_version (no hard-coded 1.81 / 2.99).
+  * The FR-22 'Score Deterioration' flag written by quant_scorer now contributes to the quantitative stream.
+  * Processes every run (all companies, all years), not only run_id DESC.
+  * Financial-sector runs (FR-20) are marked 'Not Applicable' instead of 'Low Risk'.
+  * Missing scores are not treated as safe: the run is reported as partial.
+
+The penalty sizes and band boundaries below are CALIBRATION CHOICES (SRS TBD-5): agree them with Nirali.
+
+Usage:  py report_generator.py          (every company, one line per year)
+        py report_generator.py 1        (company_id 1, with full flag list for the latest year)
+"""
 import sqlite3
+import sys
+
 import pandas as pd
-from datetime import datetime
+
+from chart_of_accounts import ALTMAN_VARIANT, ALTMAN_VARIANTS, BENEISH_THRESHOLD
 
 DB_PATH = "data/red_shift.db"
 
-# Weights from SDS Section 2.2.3 Component 5 and Tech Docs Section 3.2
-WEIGHT_QUANT = 0.40       # w1: 40%
-WEIGHT_QUAL = 0.35        # w2: 35%
-WEIGHT_MARKET = 0.25      # w3: 25%
+# Stream weights (SDS Component 5, Eq. 6) - must sum to 1
+WEIGHT_QUANT, WEIGHT_QUAL, WEIGHT_MARKET = 0.40, 0.35, 0.25
 
-def run_report_generator(company_id=1, symbol="ZEEL"):
-    print("\n=======================================================")
-    print(f"   RUNNING REPORT GENERATOR AGENT FOR {symbol}")
-    print("=======================================================")
+# Quantitative stream penalties (each stream is capped at 1.0)
+PEN_M_BREACH = 0.50
+PEN_Z_DISTRESS = 0.30
+PEN_Z_GREY = 0.15
+PEN_F_WEAK = 0.20
+PEN_DETERIORATION = 0.15
+F_WEAK = 3
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+# Severity bands (FR-44)
+BAND_HIGH, BAND_MODERATE = 65.0, 35.0
 
-    # Find the latest screening run
-    cursor.execute("""
-    SELECT run_id, fiscal_year, m_score, z_score, f_score 
-    FROM SCORE_RUN 
-    WHERE company_id = ? 
-    ORDER BY run_id DESC LIMIT 1;
-    """, (company_id,))
-    row = cursor.fetchone()
+assert abs(WEIGHT_QUANT + WEIGHT_QUAL + WEIGHT_MARKET - 1.0) < 1e-9
 
-    if not row:
-        print("No screening runs found in SCORE_RUN. Execute quant_scorer.py first.")
-        conn.close()
-        return
 
-    run_id, fiscal_year, m_score, z_score, f_score = row
+def altman_cutoffs(model_version):
+    """Pull the Altman variant out of e.g. 'v2.1-features/z_double_prime'."""
+    parts = (model_version or "").split("/")
+    variant = parts[1] if len(parts) > 1 and parts[1] in ALTMAN_VARIANTS else ALTMAN_VARIANT
+    return variant, ALTMAN_VARIANTS[variant]["cutoffs"]
 
-    # 1. Normalize Quantitative Stream (Q: 0.0 to 1.0 risk level)
-    q_penalties = 0.0
-    if m_score is not None and m_score > -1.78:
-        q_penalties += 0.50
-    if z_score is not None and z_score < 1.81:
-        q_penalties += 0.30
-    elif z_score is not None and z_score <= 2.99:
-        q_penalties += 0.15
-    if f_score is not None and f_score <= 3:
-        q_penalties += 0.20
 
-    q_stream = min(q_penalties, 1.0)
+def band_for(score):
+    if score >= BAND_HIGH:
+        return "High Risk"
+    return "Moderate Risk" if score >= BAND_MODERATE else "Low Risk"
 
-    # 2. Normalize Qualitative Stream (L: 0.0 to 1.0 risk level)
-    cursor.execute("""
-    SELECT severity FROM QUAL_FINDING 
-    WHERE run_id = ? AND verification_status = 'Verified';
-    """, (run_id,))
-    qual_rows = cursor.fetchall()
 
-    l_penalties = 0.0
-    for (sev,) in qual_rows:
-        if sev == "High":
-            l_penalties += 0.35
-        elif sev == "Medium":
-            l_penalties += 0.20
-        elif sev == "Low":
-            l_penalties += 0.10
+def score_run(cur, run):
+    run_id, _, fy, status, m, z, f, model_version = run
 
-    l_stream = min(l_penalties, 1.0)
+    # FR-20: banks / NBFCs / insurers get no composite
+    if (model_version or "").endswith("/not-applicable"):
+        cur.execute("UPDATE SCORE_RUN SET composite_score = NULL, severity_band = 'Not Applicable' WHERE run_id = ?",
+                    (run_id,))
+        return {"run_id": run_id, "fy": fy, "applicable": False}
 
-    # 3. Normalize Market Stream (B: 0.0 to 1.0 risk level)
-    cursor.execute("""
-    SELECT flag_type, severity FROM RED_FLAG 
-    WHERE run_id = ? AND category = 'Market-Behaviour';
-    """, (run_id,))
-    market_flags = cursor.fetchall()
+    # ---- Q: quantitative stream ----
+    variant, (z_lo, z_hi) = altman_cutoffs(model_version)
+    q = 0.0
+    if m is not None and m > BENEISH_THRESHOLD:
+        q += PEN_M_BREACH
+    if z is not None:
+        if z < z_lo:
+            q += PEN_Z_DISTRESS
+        elif z <= z_hi:
+            q += PEN_Z_GREY
+    if f is not None and f <= F_WEAK:
+        q += PEN_F_WEAK
+    det = cur.execute("SELECT COUNT(*) FROM RED_FLAG WHERE run_id = ? AND flag_type LIKE 'Score Deterioration%'",
+                      (run_id,)).fetchone()[0]
+    if det:
+        q += PEN_DETERIORATION
+    q = min(q, 1.0)
 
-    b_penalties = 0.0
-    for ftype, sev in market_flags:
+    # ---- L: qualitative stream ----
+    sev_pen = {"High": 0.35, "Medium": 0.20, "Low": 0.10}
+    rows = cur.execute("SELECT severity FROM QUAL_FINDING WHERE run_id = ? AND verification_status = 'Verified'",
+                       (run_id,)).fetchall()
+    l = min(sum(sev_pen.get(s, 0.0) for (s,) in rows), 1.0)
+
+    # ---- B: market stream ----
+    b = 0.0
+    for ftype, _sev in cur.execute("SELECT flag_type, severity FROM RED_FLAG WHERE run_id = ? AND category = 'Market-Behaviour'",
+                                   (run_id,)).fetchall():
         if "Divergence" in ftype:
-            b_penalties += 0.60
+            b += 0.60
         if "Volume" in ftype:
-            b_penalties += 0.40
+            b += 0.40
+    b = min(b, 1.0)
 
-    b_stream = min(b_penalties, 1.0)
+    composite = round(100.0 * (WEIGHT_QUANT * q + WEIGHT_QUAL * l + WEIGHT_MARKET * b), 2)
+    band = band_for(composite)
+    cur.execute("UPDATE SCORE_RUN SET composite_score = ?, severity_band = ? WHERE run_id = ?", (composite, band, run_id))
+    return {"run_id": run_id, "fy": fy, "applicable": True, "q": q, "l": l, "b": b, "composite": composite,
+            "band": band, "partial": None in (m, z, f), "variant": variant}
 
-    # 4. Compute Normalized Composite Risk Score (0 - 100)
-    composite_score = 100.0 * (
-        (WEIGHT_QUANT * q_stream) + 
-        (WEIGHT_QUAL * l_stream) + 
-        (WEIGHT_MARKET * b_stream)
-    )
-    composite_score = round(composite_score, 2)
 
-    # Assign Severity Band (FR-44)
-    if composite_score >= 65.0:
-        severity_band = "High Risk"
-    elif composite_score >= 35.0:
-        severity_band = "Moderate Risk"
-    else:
-        severity_band = "Low Risk"
+def run_report_generator(company_id=None, db_path=DB_PATH):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    companies = cur.execute("SELECT company_id, symbol FROM COMPANY ORDER BY company_id").fetchall()
+    if company_id is not None:
+        companies = [c for c in companies if c[0] == company_id]
 
-    # 5. Persist Composite Score and Severity Band to SCORE_RUN
-    cursor.execute("""
-    UPDATE SCORE_RUN 
-    SET composite_score = ?, severity_band = ?
-    WHERE run_id = ?;
-    """, (composite_score, severity_band, run_id))
+    for cid, symbol in companies:
+        runs = cur.execute("""SELECT run_id, company_id, fiscal_year, status, m_score, z_score, f_score, model_version
+                              FROM SCORE_RUN WHERE company_id = ? ORDER BY fiscal_year, run_id""", (cid,)).fetchall()
+        if not runs:
+            continue
+        print(f"\n=== {symbol} ===")
+        results = [score_run(cur, r) for r in runs]
+        for r in results:
+            if not r["applicable"]:
+                print(f"  FY{r['fy']}: not applicable (financial sector)")
+            else:
+                note = "  [partial: a score was missing]" if r["partial"] else ""
+                print(f"  FY{r['fy']}: Q={r['q']*100:5.1f}  L={r['l']*100:5.1f}  B={r['b']*100:5.1f}  "
+                      f"-> composite {r['composite']:5.1f}/100  {r['band']}{note}")
+
+        if company_id is not None:                      # detail for the latest year
+            latest = results[-1]
+            flags = pd.read_sql_query("SELECT category, flag_type, severity, evidence_ref FROM RED_FLAG WHERE run_id = ?",
+                                      conn, params=(latest["run_id"],))
+            print(f"\n  Flags for FY{latest['fy']} (run #{latest['run_id']}): {len(flags)}")
+            for _, fr in flags.iterrows():
+                print(f"   [{fr['severity']}] {fr['category']} -> {fr['flag_type']}")
+                print(f"        Evidence: {fr['evidence_ref']}")
 
     conn.commit()
-
-    # 6. Print Executive Forensic Summary
-    print(f"\n--- SCORECARD BREAKDOWN (Run #{run_id} | FY {fiscal_year}) ---")
-    print(f"Quantitative Stream (Weight 40%) : Risk Score = {q_stream * 100:.1f} / 100")
-    print(f"Qualitative Stream  (Weight 35%) : Risk Score = {l_stream * 100:.1f} / 100")
-    print(f"Market Stream       (Weight 25%) : Risk Score = {b_stream * 100:.1f} / 100")
-    print("-------------------------------------------------------")
-    print(f"FINAL COMPOSITE RISK SCORE       : {composite_score} / 100")
-    print(f"ASSIGNED SEVERITY BAND           : {severity_band.upper()}")
-    print("-------------------------------------------------------")
-
-    flags_df = pd.read_sql_query("""
-    SELECT category, flag_type, severity, evidence_ref 
-    FROM RED_FLAG 
-    WHERE run_id = ?;
-    """, conn, params=(run_id,))
-
-    print(f"\nTOTAL FLAGS RAISED: {len(flags_df)}")
-    for idx, row in flags_df.iterrows():
-        print(f"[{row['severity']}] {row['category']} -> {row['flag_type']}")
-        print(f"       Evidence: {row['evidence_ref']}")
-
     conn.close()
-    print("\nReport generation completed and stored to SQLite.")
+    print("\nComposite scores and severity bands saved to SCORE_RUN.")
+
 
 if __name__ == "__main__":
-    run_report_generator(company_id=1, symbol="ZEEL")
+    run_report_generator(int(sys.argv[1]) if len(sys.argv) > 1 else None)

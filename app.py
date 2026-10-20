@@ -1,175 +1,153 @@
 import sqlite3
-import pandas as pd
-import streamlit as st
-import plotly.express as px
+
 import joblib
-import numpy as np
-import features # <-- Import Yashi's feature script
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+import features
+from chart_of_accounts import ALTMAN_VARIANT, ALTMAN_VARIANTS, BENEISH_THRESHOLD
 
 DB_PATH = "data/red_shift.db"
-PRICES_CSV = "data/ZEEL.NS_prices.csv"
+MODEL_PATH = "data/red_shift_risk_model.pkl"
+INDEX_ORDER = ["DSRI", "GMI", "AQI", "SGI", "DEPI", "SGAI", "TATA", "LVGI"]
 
-# Configure dashboard page
-st.set_page_config(
-    page_title="Red Shift | Forensic Analytics Platform",
-    page_icon="🔍",
-    layout="wide"
-)
+st.set_page_config(page_title="Red Shift | Forensic Analytics Platform", page_icon="🔍", layout="wide")
 
 st.title("Red Shift: Automated Forensic Analytics")
 st.caption("Forensic Red-Flag Detection for Listed Indian Companies")
 
-# Database connection
+
+@st.cache_resource
+def load_model():
+    return joblib.load(MODEL_PATH)
+
+
 conn = sqlite3.connect(DB_PATH)
 
-# Fetch registered companies
-companies_df = pd.read_sql_query("SELECT company_id, symbol, name, sector FROM COMPANY", conn)
-
+companies_df = pd.read_sql_query("SELECT company_id, symbol, name, sector, is_financial FROM COMPANY", conn)
 if companies_df.empty:
-    st.error("No companies found in database. Run load_financials.py first.")
+    st.error("No companies found in database. Run load_bulk_data.py first.")
     st.stop()
 
-# Company selector dropdown
-selected_symbol = st.selectbox(
-    "Select Target Company to Inspect:",
-    options=companies_df["symbol"].tolist(),
-    index=0
-)
-
+selected_symbol = st.selectbox("Select Target Company to Inspect:", options=companies_df["symbol"].tolist(), index=0)
 company_row = companies_df[companies_df["symbol"] == selected_symbol].iloc[0]
 company_id = int(company_row["company_id"])
+PRICES_CSV = f"data/{selected_symbol}.NS_prices.csv"          # per-company price file
 
-# Fetch latest screening run details
-run_query = """
-SELECT run_id, fiscal_year, m_score, z_score, f_score, composite_score, severity_band 
-FROM SCORE_RUN 
-WHERE company_id = ? 
-ORDER BY run_id DESC LIMIT 1;
-"""
-run_df = pd.read_sql_query(run_query, conn, params=(company_id,))
-
+# Latest screening run = latest FISCAL YEAR (not latest run_id)
+run_df = pd.read_sql_query(
+    """SELECT run_id, fiscal_year, m_score, z_score, f_score, composite_score, severity_band, model_version
+       FROM SCORE_RUN WHERE company_id = ?
+       ORDER BY fiscal_year DESC, run_id DESC LIMIT 1;""", conn, params=(company_id,))
 if run_df.empty:
-    st.warning("No screening run data available. Execute the scoring scripts first.")
+    st.warning("No screening run data available. Run quant_scorer.py and report_generator.py first.")
     st.stop()
 
 latest_run = run_df.iloc[0]
 run_id = int(latest_run["run_id"])
+run_year = int(latest_run["fiscal_year"])
+
+# Altman cut-offs for the variant this run used
+parts = str(latest_run["model_version"]).split("/")
+variant = parts[1] if len(parts) > 1 and parts[1] in ALTMAN_VARIANTS else ALTMAN_VARIANT
+z_distress = ALTMAN_VARIANTS[variant]["cutoffs"][0]
 
 # ----------------- SECTION 1: HEADER METRICS -----------------
-st.subheader(f"Screening Summary: {company_row['name']} ({company_row['symbol']})")
+st.subheader(f"Screening Summary: {company_row['name']} ({company_row['symbol']}) | FY{run_year}")
 
 col1, col2, col3, col4 = st.columns(4)
-
 with col1:
-    comp_score = latest_run["composite_score"] if pd.notnull(latest_run["composite_score"]) else 0.0
-    st.metric(label="Composite Risk Score", value=f"{comp_score} / 100")
-
+    cs = latest_run["composite_score"]
+    st.metric("Composite Risk Score", f"{cs} / 100" if pd.notnull(cs) else "N/A")
 with col2:
-    sev_band = str(latest_run["severity_band"]).upper()
-    st.metric(label="Severity Band", value=sev_band)
-
+    sb = latest_run["severity_band"]
+    st.metric("Severity Band", str(sb).upper() if pd.notnull(sb) else "N/A")
 with col3:
     m_val = latest_run["m_score"]
-    st.metric(label="Beneish M-Score", value=f"{m_val:.2f}" if pd.notnull(m_val) else "N/A", delta="Manipulator (> -1.78)" if m_val and m_val > -1.78 else "Safe", delta_color="inverse")
-
+    if pd.notnull(m_val):
+        st.metric("Beneish M-Score", f"{m_val:.2f}",
+                  delta=f"Manipulator (> {BENEISH_THRESHOLD})" if m_val > BENEISH_THRESHOLD else "Safe",
+                  delta_color="inverse")
+    else:
+        st.metric("Beneish M-Score", "N/A")
 with col4:
     z_val = latest_run["z_score"]
-    st.metric(label="Altman Z-Score", value=f"{z_val:.2f}" if pd.notnull(z_val) else "N/A", delta="Distress (< 1.81)" if z_val and z_val < 1.81 else "Safe")
+    if pd.notnull(z_val):
+        st.metric(f"Altman Z-Score ({variant})", f"{z_val:.2f}",
+                  delta=f"Distress (< {z_distress})" if z_val < z_distress else "Not in distress")
+    else:
+        st.metric("Altman Z-Score", "N/A")
+
+if int(company_row["is_financial"]) == 1:
+    st.info("Beneish and Altman models are not valid for banks, NBFCs and insurers (FR-20), so no score is reported.")
 
 st.divider()
 
-# ----------------- SECTION 1.5: YASHI'S MACHINE LEARNING MODEL -----------------
-st.subheader("🤖 Machine Learning Risk Assessment")
-st.write("This prediction is generated by the Random Forest model trained on NIFTY50 historical data.")
+# ----------------- SECTION 1.5: EXPERIMENTAL ML BASELINE -----------------
+st.subheader("🤖 Machine Learning Baseline (experimental)")
+st.caption("A Random Forest trained on 24 company-years from 8 companies to reproduce a rule-based risk label. "
+           "It has not been validated on unseen companies and can disagree with the scores above.")
 try:
-    model = joblib.load('data/red_shift_risk_model.pkl')
+    model = load_model()
     feats = features.build_features(company_id=company_id)
-    latest_year = max(feats['years'].keys()) if feats['years'] else None
-    
-    if latest_year and feats['years'][latest_year]['beneish']['m_score'] is not None:
-        indices = feats['years'][latest_year]['beneish']['indices']
-        
-        ml_features = [[
-            indices.get('DSRI', 1.0), indices.get('GMI', 1.0), indices.get('AQI', 1.0), indices.get('SGI', 1.0),
-            indices.get('DEPI', 1.0), indices.get('SGAI', 1.0), indices.get('TATA', 0.0), indices.get('LVGI', 1.0)
-        ]]
-        
-        ml_pred = model.predict(ml_features)[0]
-        ml_prob = model.predict_proba(ml_features)[0][1]
-        
-        if ml_pred == 1:
-            st.error(f"🚨 **ML Alert:** The model predicts this company is **RISKY** (Confidence: {ml_prob*100:.1f}%)")
+    yr = feats["years"].get(run_year)
+    if yr and yr["beneish"].get("m_score") is not None:
+        idx = yr["beneish"]["indices"]
+        pred = model.predict([[idx[k] for k in INDEX_ORDER]])[0]
+        if pred == 1:
+            st.warning("Baseline model output: **risk pattern** (resembles company-years the rule labelled risky).")
         else:
-            st.success(f"✅ **ML Alert:** The model predicts this company is **SAFE** (Confidence: {(1-ml_prob)*100:.1f}%)")
+            st.success("Baseline model output: **no risk pattern** (resembles company-years the rule labelled safe).")
     else:
-        st.info("ML model cannot run: Missing feature data (e.g., financial sector or insufficient history).")
+        st.info("Baseline model not run: no Beneish indices for this company-year (e.g. financial sector or missing data).")
+except FileNotFoundError:
+    st.caption("Model file not found. Run train_model.py to create data/red_shift_risk_model.pkl.")
 except Exception as e:
-    st.caption(f"ML model not loaded. Error: {e}")
+    st.caption(f"Baseline model unavailable: {e}")
 
 st.divider()
 
 # ----------------- SECTION 2: RED FLAGS & EVIDENCE -----------------
 st.subheader("Forensic Red Flags & Evidence Reference")
-
-flags_query = """
-SELECT category, flag_type, severity, explanation, evidence_ref 
-FROM RED_FLAG 
-WHERE run_id = ?;
-"""
-flags_df = pd.read_sql_query(flags_query, conn, params=(run_id,))
-
+flags_df = pd.read_sql_query(
+    "SELECT category, flag_type, severity, explanation, evidence_ref FROM RED_FLAG WHERE run_id = ?;",
+    conn, params=(run_id,))
 if not flags_df.empty:
-    st.dataframe(
-        flags_df,
-        use_container_width=True,
-        column_config={
-            "category": "Category",
-            "flag_type": "Flag Type",
-            "severity": "Severity",
-            "explanation": "Plain Language Finding",
-            "evidence_ref": "Underlying Traceable Evidence"
-        }
-    )
+    st.dataframe(flags_df, width="stretch", column_config={
+        "category": "Category", "flag_type": "Flag Type", "severity": "Severity",
+        "explanation": "Plain Language Finding", "evidence_ref": "Underlying Traceable Evidence"})
 else:
-    st.success("No critical red flags raised for this reporting period.")
+    st.success("No red flags raised for this reporting period.")
 
 # ----------------- SECTION 3: QUALITATIVE AUDIT LOG -----------------
 st.subheader("Filing Narrative Findings (Grounding Guard Verified)")
-qual_query = """
-SELECT theme, severity, finding_text, quotation, verification_status 
-FROM QUAL_FINDING 
-WHERE run_id = ?;
-"""
-qual_df = pd.read_sql_query(qual_query, conn, params=(run_id,))
-
+qual_df = pd.read_sql_query(
+    "SELECT theme, severity, finding_text, quotation, verification_status FROM QUAL_FINDING WHERE run_id = ?;",
+    conn, params=(run_id,))
 if not qual_df.empty:
-    for _, qrow in qual_df.iterrows():
-        with st.expander(f"[{qrow['severity']}] {qrow['theme']} — Status: {qrow['verification_status']}"):
-            st.write(f"**Finding:** {qrow['finding_text']}")
-            st.info(f"**Verbatim Source Quotation:** \"{qrow['quotation']}\"")
+    for _, q in qual_df.iterrows():
+        with st.expander(f"[{q['severity']}] {q['theme']} — Status: {q['verification_status']}"):
+            st.write(f"**Finding:** {q['finding_text']}")
+            st.info(f"**Verbatim Source Quotation:** \"{q['quotation']}\"")
 else:
-    st.info("No narrative disclosures recorded.")
+    st.info("No narrative disclosures recorded for this company-year.")
 
 # ----------------- SECTION 4: MARKET BEHAVIOUR CHART -----------------
 st.subheader("Market Behaviour & Price Action")
 try:
     price_df = pd.read_csv(PRICES_CSV, header=[0, 1], index_col=0)
     price_df.columns = price_df.columns.get_level_values(0)
-    price_df.index = pd.to_datetime(price_df.index, errors='coerce')
+    price_df.index = pd.to_datetime(price_df.index, errors="coerce")
     price_df = price_df.dropna(subset=["Close"])
-    
-    fig = px.line(
-        price_df, 
-        x=price_df.index, 
-        y="Close", 
-        title=f"{selected_symbol} Historical Daily Closing Price",
-        labels={"x": "Date", "Close": "Closing Price (INR)"}
-    )
-    st.plotly_chart(fig, use_container_width=True)
+    fig = px.line(price_df, x=price_df.index, y="Close", title=f"{selected_symbol} Historical Daily Closing Price",
+                  labels={"x": "Date", "Close": "Closing Price (INR)"})
+    st.plotly_chart(fig, width="stretch")
 except Exception:
-    st.caption("Price chart unavailable. Check market CSV files.")
+    st.caption(f"Price chart unavailable: no price file found at {PRICES_CSV}.")
 
 conn.close()
 
-# Mandatory Analytical Disclaimer (FR-48)
-st.caption("Disclaimer: This report constitutes forensic analytical information for screening purposes and does not represent investment advice. No assertion of statutory fraud is made or implied.")
+# Mandatory analytical disclaimer (FR-48)
+st.caption("Disclaimer: This report constitutes forensic analytical information for screening purposes and does not "
+           "represent investment advice. No assertion of statutory fraud is made or implied.")
